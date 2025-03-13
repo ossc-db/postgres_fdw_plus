@@ -1,0 +1,456 @@
+From c704fc1a890d638ab1d844f0a8282f65cef025ac Mon Sep 17 00:00:00 2001
+From: Yuya Watari <watari.yuya@gmail.com>
+Date: Thu, 13 Mar 2025 13:45:07 +0900
+Subject: [PATCH] Add atomic visibility feature (v2)
+
+This commit changes the snapshot architecture to guarantee atomic
+visibility. With the new snapshot architecture, all prepared
+transactions are treated as finished, and waited for when accessing
+tuples. This ensures read consistency across multiple PostgreSQL
+servers.
+---
+ src/backend/access/common/Makefile            |  1 +
+ src/backend/access/common/atomic_visibility.c | 76 +++++++++++++++++++
+ src/backend/access/common/meson.build         |  1 +
+ src/backend/access/transam/twophase.c         |  5 ++
+ .../replication/logical/reorderbuffer.c       |  6 +-
+ src/backend/storage/ipc/procarray.c           | 22 +++++-
+ src/backend/utils/time/snapmgr.c              | 47 +++++++++++-
+ src/include/access/atomic_visibility.h        | 22 ++++++
+ src/include/utils/elog.h                      |  5 ++
+ src/include/utils/snapshot.h                  | 16 +++-
+ 10 files changed, 194 insertions(+), 7 deletions(-)
+ create mode 100644 src/backend/access/common/atomic_visibility.c
+ create mode 100644 src/include/access/atomic_visibility.h
+
+diff --git a/src/backend/access/common/Makefile b/src/backend/access/common/Makefile
+index e78de312659..ebf616cade5 100644
+--- a/src/backend/access/common/Makefile
++++ b/src/backend/access/common/Makefile
+@@ -13,6 +13,7 @@ top_builddir = ../../../..
+ include $(top_builddir)/src/Makefile.global
+ 
+ OBJS = \
++	atomic_visibility.o \
+ 	attmap.o \
+ 	bufmask.o \
+ 	detoast.o \
+diff --git a/src/backend/access/common/atomic_visibility.c b/src/backend/access/common/atomic_visibility.c
+new file mode 100644
+index 00000000000..93e5de6645b
+--- /dev/null
++++ b/src/backend/access/common/atomic_visibility.c
+@@ -0,0 +1,76 @@
++/*-------------------------------------------------------------------------
++ *
++ * atomic_visibility.c
++ *	  Atomic visibility support.
++ *
++ * Portions Copyright (c) 2024-2025, PostgreSQL Global Development Group
++ * Portions Copyright (c) 1994, Regents of the University of California
++ *
++ * IDENTIFICATION
++ *	  src/backend/access/common/atomic_visibility.c
++ *
++ * This file provides an atomic visibility feature.
++ *
++ * Our approach to guarantee atomic visibility is to wait for prepared
++ * transactions to finish. However, waiting for all prepared transactions is a
++ * time-consuming task and leads to performance bottlenecks. We don't wait for
++ * transactions that are not relevant to the query results and speed up atomic
++ * visibility. To achieve this goal, we change the architecture of snapshots.
++ * In the original snapshot, all transactions including prepared transactions
++ * are marked as in progress when GetSnapshotData() is called. With our
++ * modification, prepared transactions are treated as finished. Such
++ * transactions are stored in the SnapshotData->x2pc[] array. When accessing
++ * tuples, if xmin or xmax are in the array, we wait for those transactions to
++ * finish. This approach eliminates waiting for transactions that do not
++ * affect query results, so we can drastically improve performance.
++ *
++ *-------------------------------------------------------------------------
++ */
++
++#include "postgres.h"
++
++#include "access/atomic_visibility.h"
++#include "access/xact.h"
++#include "port/pg_lfind.h"
++#include "storage/lmgr.h"
++
++
++/*
++ * Returns true if we need to wait for the transaction according to the given
++ * snapshot.
++ */
++static bool
++ShouldWaitForTransaction(TransactionId xid, Snapshot snapshot)
++{
++	/*
++	 * Callers of WaitForPreparedXactsInSnapshot must ensure that xid is in
++	 * the snapshot.
++	 */
++	Assert(!TransactionIdPrecedes(xid, snapshot->xmin));
++	Assert(!TransactionIdFollowsOrEquals(xid, snapshot->xmax));
++
++	return pg_lfind32(xid, snapshot->x2pc, snapshot->x2pc_cnt);
++}
++
++/*
++ * Wait for the given transaction.
++ */
++static void
++WaitForTransaction(TransactionId xid)
++{
++	wlog(LOG, "Waiting XID %u", xid);
++	XactLockTableWait(xid, NULL, NULL, XLTW_None);
++	wlog(LOG, "Waited XID %u", xid);
++}
++
++/*
++ * If necessary, wait for xmin and xmax according to the given MVCC snapshot.
++ */
++void
++WaitForPreparedXactsInSnapshot(TransactionId xid, Snapshot snapshot)
++{
++	Assert(snapshot->snapshot_type == SNAPSHOT_MVCC ||
++		   snapshot->snapshot_type == SNAPSHOT_HISTORIC_MVCC);
++	if (ShouldWaitForTransaction(xid, snapshot))
++		WaitForTransaction(xid);
++}
+diff --git a/src/backend/access/common/meson.build b/src/backend/access/common/meson.build
+index e3cdbe7a22e..2ff1876dd08 100644
+--- a/src/backend/access/common/meson.build
++++ b/src/backend/access/common/meson.build
+@@ -1,6 +1,7 @@
+ # Copyright (c) 2022-2025, PostgreSQL Global Development Group
+ 
+ backend_sources += files(
++  'atomic_visibility.c',
+   'attmap.c',
+   'bufmask.c',
+   'detoast.c',
+diff --git a/src/backend/access/transam/twophase.c b/src/backend/access/transam/twophase.c
+index 73a80559194..0f3e7e5ea80 100644
+--- a/src/backend/access/transam/twophase.c
++++ b/src/backend/access/transam/twophase.c
+@@ -229,6 +229,7 @@ static void MarkAsPreparingGuts(GlobalTransaction gxact, TransactionId xid,
+ 								Oid databaseid);
+ static void RemoveTwoPhaseFile(TransactionId xid, bool giveWarning);
+ static void RecreateTwoPhaseFile(TransactionId xid, void *content, int len);
++static inline FullTransactionId AdjustToFullTransactionId(TransactionId xid);
+ 
+ /*
+  * Initialization of shared memory
+@@ -462,7 +463,11 @@ MarkAsPreparingGuts(GlobalTransaction gxact, TransactionId xid, const char *gid,
+ 	Assert(proc->xmin == InvalidTransactionId);
+ 	proc->delayChkptFlags = 0;
+ 	proc->statusFlags = 0;
++	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+ 	proc->pid = 0;
++	if (TransactionIdPrecedes(XidFromFullTransactionId(TransamVariables->latestCompletedXid), xid))
++		TransamVariables->latestCompletedXid = AdjustToFullTransactionId(xid);
++	LWLockRelease(ProcArrayLock);
+ 	proc->databaseId = databaseid;
+ 	proc->roleId = owner;
+ 	proc->tempNamespaceId = InvalidOid;
+diff --git a/src/backend/replication/logical/reorderbuffer.c b/src/backend/replication/logical/reorderbuffer.c
+index 5186ad2a397..36eac7426e5 100644
+--- a/src/backend/replication/logical/reorderbuffer.c
++++ b/src/backend/replication/logical/reorderbuffer.c
+@@ -1897,7 +1897,8 @@ ReorderBufferCopySnap(ReorderBuffer *rb, Snapshot orig_snap,
+ 
+ 	size = sizeof(SnapshotData) +
+ 		sizeof(TransactionId) * orig_snap->xcnt +
+-		sizeof(TransactionId) * (txn->nsubtxns + 1);
++		sizeof(TransactionId) * (txn->nsubtxns + 1) +
++		sizeof(TransactionId) * orig_snap->x2pc_cnt;
+ 
+ 	snap = MemoryContextAllocZero(rb->context, size);
+ 	memcpy(snap, orig_snap, sizeof(SnapshotData));
+@@ -1909,6 +1910,9 @@ ReorderBufferCopySnap(ReorderBuffer *rb, Snapshot orig_snap,
+ 
+ 	memcpy(snap->xip, orig_snap->xip, sizeof(TransactionId) * snap->xcnt);
+ 
++	snap->x2pc = snap->xip + snap->xcnt + (txn->nsubtxns + 1);
++	memcpy(snap->x2pc, orig_snap->x2pc, sizeof(TransactionId) * snap->x2pc_cnt);
++
+ 	/*
+ 	 * snap->subxip contains all txids that belong to our transaction which we
+ 	 * need to check via cmin/cmax. That's why we store the toplevel
+diff --git a/src/backend/storage/ipc/procarray.c b/src/backend/storage/ipc/procarray.c
+index 2e54c11f880..8df14e407ef 100644
+--- a/src/backend/storage/ipc/procarray.c
++++ b/src/backend/storage/ipc/procarray.c
+@@ -2179,6 +2179,7 @@ GetSnapshotData(Snapshot snapshot)
+ 	TransactionId xmin;
+ 	TransactionId xmax;
+ 	int			count = 0;
++	int			twopc_count = 0;
+ 	int			subcount = 0;
+ 	bool		suboverflowed = false;
+ 	FullTransactionId latest_completed;
+@@ -2224,6 +2225,10 @@ GetSnapshotData(Snapshot snapshot)
+ 					 errmsg("out of memory")));
+ 	}
+ 
++	if (snapshot->x2pc == NULL)
++		snapshot->x2pc = (TransactionId *)
++			malloc(GetMaxSnapshotXidCount() * sizeof(TransactionId));
++
+ 	/*
+ 	 * It is sufficient to get shared lock on ProcArrayLock, even if we are
+ 	 * going to set MyProc->xmin.
+@@ -2262,6 +2267,7 @@ GetSnapshotData(Snapshot snapshot)
+ 	{
+ 		int			numProcs = arrayP->numProcs;
+ 		TransactionId *xip = snapshot->xip;
++		TransactionId *x2pc = snapshot->x2pc;
+ 		int		   *pgprocnos = arrayP->pgprocnos;
+ 		XidCacheStatus *subxidStates = ProcGlobal->subxidStates;
+ 		uint8	   *allStatusFlags = ProcGlobal->statusFlags;
+@@ -2275,7 +2281,10 @@ GetSnapshotData(Snapshot snapshot)
+ 			/* Fetch xid just once - see GetNewTransactionId */
+ 			TransactionId xid = UINT32_ACCESS_ONCE(other_xids[pgxactoff]);
+ 			uint8		statusFlags;
++			int			pid;
+ 
++			wlog(LOG, "[GetSnapshotData] Checking XID %u under [%u, %u)",
++				 xid, xmin, xmax);
+ 			Assert(allProcs[arrayP->pgprocnos[pgxactoff]].pgxactoff == pgxactoff);
+ 
+ 			/*
+@@ -2321,7 +2330,17 @@ GetSnapshotData(Snapshot snapshot)
+ 				xmin = xid;
+ 
+ 			/* Add XID to snapshot. */
+-			xip[count++] = xid;
++			pid = allProcs[pgprocnos[pgxactoff]].pid;
++			if (pid == 0)
++			{
++				wlog(LOG, "[GetSnapshotData(%p)] XID %u is prepared", x2pc, xid);
++				x2pc[twopc_count++] = xid;	/* prepared transaction */
++			}
++			else
++			{
++				wlog(LOG, "[GetSnapshotData(%p)] XID %u is in progress", xip, xid);
++				xip[count++] = xid; /* in progress transaction */
++			}
+ 
+ 			/*
+ 			 * Save subtransaction XIDs if possible (if we've already
+@@ -2501,6 +2520,7 @@ GetSnapshotData(Snapshot snapshot)
+ 	snapshot->xmin = xmin;
+ 	snapshot->xmax = xmax;
+ 	snapshot->xcnt = count;
++	snapshot->x2pc_cnt = twopc_count;
+ 	snapshot->subxcnt = subcount;
+ 	snapshot->suboverflowed = suboverflowed;
+ 	snapshot->snapXactCompletionCount = curXactCompletionCount;
+diff --git a/src/backend/utils/time/snapmgr.c b/src/backend/utils/time/snapmgr.c
+index ea35f30f494..67b13a27daf 100644
+--- a/src/backend/utils/time/snapmgr.c
++++ b/src/backend/utils/time/snapmgr.c
+@@ -107,6 +107,7 @@
+ #include <sys/stat.h>
+ #include <unistd.h>
+ 
++#include "access/atomic_visibility.h"
+ #include "access/subtrans.h"
+ #include "access/transam.h"
+ #include "access/xact.h"
+@@ -253,6 +254,7 @@ typedef struct SerializedSnapshotData
+ 	TransactionId xmax;
+ 	uint32		xcnt;
+ 	int32		subxcnt;
++	uint32		x2pc_cnt;
+ 	bool		suboverflowed;
+ 	bool		takenDuringRecovery;
+ 	CommandId	curcid;
+@@ -602,7 +604,8 @@ CopySnapshot(Snapshot snapshot)
+ 
+ 	/* We allocate any XID arrays needed in the same palloc block. */
+ 	size = subxipoff = sizeof(SnapshotData) +
+-		snapshot->xcnt * sizeof(TransactionId);
++		snapshot->xcnt * sizeof(TransactionId) +
++		snapshot->x2pc_cnt * sizeof(TransactionId);
+ 	if (snapshot->subxcnt > 0)
+ 		size += snapshot->subxcnt * sizeof(TransactionId);
+ 
+@@ -624,6 +627,15 @@ CopySnapshot(Snapshot snapshot)
+ 	else
+ 		newsnap->xip = NULL;
+ 
++	if (snapshot->x2pc_cnt > 0)
++	{
++		newsnap->x2pc = (TransactionId *) (newsnap + 1) + snapshot->xcnt;
++		memcpy(newsnap->x2pc, snapshot->x2pc,
++			   snapshot->x2pc_cnt * sizeof(TransactionId));
++	}
++	else
++		newsnap->x2pc = NULL;
++
+ 	/*
+ 	 * Setup subXID array. Don't bother to copy it if it had overflowed,
+ 	 * though, because it's not used anywhere in that case. Except if it's a
+@@ -1710,6 +1722,8 @@ EstimateSnapshotSpace(Snapshot snapshot)
+ 		(!snapshot->suboverflowed || snapshot->takenDuringRecovery))
+ 		size = add_size(size,
+ 						mul_size(snapshot->subxcnt, sizeof(TransactionId)));
++	size = add_size(size,
++					mul_size(snapshot->x2pc_cnt, sizeof(TransactionId)));
+ 
+ 	return size;
+ }
+@@ -1731,6 +1745,7 @@ SerializeSnapshot(Snapshot snapshot, char *start_address)
+ 	serialized_snapshot.xmax = snapshot->xmax;
+ 	serialized_snapshot.xcnt = snapshot->xcnt;
+ 	serialized_snapshot.subxcnt = snapshot->subxcnt;
++	serialized_snapshot.x2pc_cnt = snapshot->x2pc_cnt;
+ 	serialized_snapshot.suboverflowed = snapshot->suboverflowed;
+ 	serialized_snapshot.takenDuringRecovery = snapshot->takenDuringRecovery;
+ 	serialized_snapshot.curcid = snapshot->curcid;
+@@ -1767,6 +1782,16 @@ SerializeSnapshot(Snapshot snapshot, char *start_address)
+ 		memcpy((TransactionId *) (start_address + subxipoff),
+ 			   snapshot->subxip, snapshot->subxcnt * sizeof(TransactionId));
+ 	}
++
++	/* Copy x2pc array */
++	if (snapshot->x2pc_cnt > 0)
++	{
++		Size		x2pcoff = sizeof(SerializedSnapshotData) +
++			(snapshot->xcnt + snapshot->subxcnt) * sizeof(TransactionId);
++
++		memcpy((TransactionId *) (start_address + x2pcoff),
++			   snapshot->x2pc, snapshot->x2pc_cnt * sizeof(TransactionId));
++	}
+ }
+ 
+ /*
+@@ -1792,7 +1817,8 @@ RestoreSnapshot(char *start_address)
+ 	/* We allocate any XID arrays needed in the same palloc block. */
+ 	size = sizeof(SnapshotData)
+ 		+ serialized_snapshot.xcnt * sizeof(TransactionId)
+-		+ serialized_snapshot.subxcnt * sizeof(TransactionId);
++		+ serialized_snapshot.subxcnt * sizeof(TransactionId)
++		+ serialized_snapshot.x2pc_cnt * sizeof(TransactionId);
+ 
+ 	/* Copy all required fields */
+ 	snapshot = (Snapshot) MemoryContextAlloc(TopTransactionContext, size);
+@@ -1803,6 +1829,8 @@ RestoreSnapshot(char *start_address)
+ 	snapshot->xcnt = serialized_snapshot.xcnt;
+ 	snapshot->subxip = NULL;
+ 	snapshot->subxcnt = serialized_snapshot.subxcnt;
++	snapshot->x2pc = NULL;
++	snapshot->x2pc_cnt = serialized_snapshot.x2pc_cnt;
+ 	snapshot->suboverflowed = serialized_snapshot.suboverflowed;
+ 	snapshot->takenDuringRecovery = serialized_snapshot.takenDuringRecovery;
+ 	snapshot->curcid = serialized_snapshot.curcid;
+@@ -1825,6 +1853,16 @@ RestoreSnapshot(char *start_address)
+ 			   serialized_snapshot.subxcnt * sizeof(TransactionId));
+ 	}
+ 
++	/* Copy x2pcs, if present. */
++	if (serialized_snapshot.x2pc_cnt > 0)
++	{
++		snapshot->x2pc = ((TransactionId *) (snapshot + 1)) +
++			(serialized_snapshot.xcnt + serialized_snapshot.subxcnt);
++		memcpy(snapshot->subxip,
++			   serialized_xids + serialized_snapshot.xcnt + serialized_snapshot.subxcnt,
++			   serialized_snapshot.x2pc_cnt * sizeof(TransactionId));
++	}
++
+ 	/* Set the copied flag so that the caller will set refcounts correctly. */
+ 	snapshot->regd_count = 0;
+ 	snapshot->active_count = 0;
+@@ -1873,6 +1911,11 @@ XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
+ 	if (TransactionIdFollowsOrEquals(xid, snapshot->xmax))
+ 		return true;
+ 
++	/*
++	 * Wait for prepared transactions to ensure atomic visibility.
++	 */
++	WaitForPreparedXactsInSnapshot(xid, snapshot);
++
+ 	/*
+ 	 * Snapshot information is stored slightly differently in snapshots taken
+ 	 * during recovery.
+diff --git a/src/include/access/atomic_visibility.h b/src/include/access/atomic_visibility.h
+new file mode 100644
+index 00000000000..c3c2c031467
+--- /dev/null
++++ b/src/include/access/atomic_visibility.h
+@@ -0,0 +1,22 @@
++/*-------------------------------------------------------------------------
++ *
++ * atomic_visibility.h
++ *	  Atomic visibility support.
++ *
++ *
++ * Portions Copyright (c) 2024-2025, PostgreSQL Global Development Group
++ * Portions Copyright (c) 1994, Regents of the University of California
++ *
++ * src/include/access/atomic_visibility.h
++ *
++ *-------------------------------------------------------------------------
++ */
++#ifndef ATOMIC_VISIBILITY_H
++#define ATOMIC_VISIBILITY_H
++
++#include "c.h"
++#include "utils/snapshot.h"
++
++extern void WaitForPreparedXactsInSnapshot(TransactionId xid, Snapshot snapshot);
++
++#endif							/* ATOMIC_VISIBILITY_H */
+diff --git a/src/include/utils/elog.h b/src/include/utils/elog.h
+index a0244bff1fc..156fa37e5df 100644
+--- a/src/include/utils/elog.h
++++ b/src/include/utils/elog.h
+@@ -236,6 +236,11 @@ extern int	getinternalerrposition(void);
+  *		elog(ERROR, "portal \"%s\" not found", stmt->portalname);
+  *----------
+  */
++#ifdef USE_ASSERT_CHECKING
++#define wlog elog
++#else
++#define wlog(...) ((void) 0)	/* Do nothing */
++#endif
+ #define elog(elevel, ...)  \
+ 	ereport(elevel, errmsg_internal(__VA_ARGS__))
+ 
+diff --git a/src/include/utils/snapshot.h b/src/include/utils/snapshot.h
+index 0e546ec1497..2eb05ad4d0f 100644
+--- a/src/include/utils/snapshot.h
++++ b/src/include/utils/snapshot.h
+@@ -155,15 +155,25 @@ typedef struct SnapshotData
+ 
+ 	/*
+ 	 * For normal MVCC snapshot this contains the all xact IDs that are in
+-	 * progress, unless the snapshot was taken during recovery in which case
+-	 * it's empty. For historic MVCC snapshots, the meaning is inverted, i.e.
+-	 * it contains *committed* transactions between xmin and xmax.
++	 * progress but not prepared, unless the snapshot was taken during
++	 * recovery in which case it's empty. For historic MVCC snapshots, the
++	 * meaning is inverted, i.e. it contains *committed* transactions between
++	 * xmin and xmax.
+ 	 *
+ 	 * note: all ids in xip[] satisfy xmin <= xip[i] < xmax
+ 	 */
+ 	TransactionId *xip;
+ 	uint32		xcnt;			/* # of xact ids in xip[] */
+ 
++	/*
++	 * This contains the all xact IDs that are prepared when GetSnapshotData()
++	 * is called.
++	 *
++	 * note: all ids in x2pc[] satisfy xmin <= x2pc[i] < xmax
++	 */
++	TransactionId *x2pc;
++	uint32		x2pc_cnt;		/* # of xact ids in x2pc[] */
++
+ 	/*
+ 	 * For non-historic MVCC snapshots, this contains subxact IDs that are in
+ 	 * progress (and other transactions that are in progress if taken during
+-- 
+2.45.2.windows.1
+
