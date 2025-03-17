@@ -48,3 +48,7 @@ To enable Atomic Visibility, follow these steps:
    =# ALTER SYSTEM SET postgres_fdw.use_read_committed TO on;
    =# SELECT pg_reload_conf();
    ```
+
+## Note
+
+This patch is created against commit 043745c3a01fece996e4818945138320d10261bf.
